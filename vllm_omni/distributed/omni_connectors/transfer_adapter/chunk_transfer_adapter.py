@@ -112,6 +112,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             int(os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_SCHEDULER_STATS_LOG_EVERY", "100") or 100),
         )
         self._code2wav_stats_next_log = self._code2wav_stats_log_every
+        self._code2wav_stats_ticks = 0
         if self._code2wav_microbatch.enabled:
             logger.info(
                 "Code2Wav microbatch scheduler enabled: max_batch_size=%d wait_ms=%.3f",
@@ -634,6 +635,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 running_queue.append(request)
 
     def _release_due_code2wav_microbatches(self, waiting_queue: Any, running_queue: list[Request]) -> None:
+        self._code2wav_stats_ticks += 1
         for group in self._code2wav_microbatch.poll(time.monotonic()):
             self._release_code2wav_group(group, waiting_queue, running_queue)
         self._log_code2wav_scheduler_stats()
@@ -643,7 +645,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
         stats = self._code2wav_microbatch.stats_snapshot()
         offers = int(stats["offers"])
-        if offers < self._code2wav_stats_next_log:
+        if self._code2wav_stats_ticks < self._code2wav_stats_next_log:
             return
         logger.info(
             "Code2Wav scheduler stats: offers=%d pending=%d matched_b2=%d "
@@ -659,7 +661,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             stats["cancelled"],
             stats["max_ready_skew_ms"],
         )
-        self._code2wav_stats_next_log = offers + self._code2wav_stats_log_every
+        self._code2wav_stats_next_log = self._code2wav_stats_ticks + self._code2wav_stats_log_every
 
     def _offer_code2wav_chunk(
         self,
