@@ -116,6 +116,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._code2wav_load_completions = 0
         self._code2wav_ready_for_admission = 0
         self._code2wav_bypassed_no_audio = 0
+        self._code2wav_logged_first_payload: set[str] = set()
         if self._code2wav_microbatch.enabled:
             logger.info(
                 "Code2Wav microbatch scheduler enabled: max_batch_size=%d wait_ms=%.3f",
@@ -334,6 +335,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
             self._code2wav_load_completions += 1
+            if req_id not in self._code2wav_logged_first_payload or payload_finished or payload_segment_finished:
+                audio = payload_data.get("codes", {}).get("audio") if isinstance(payload_data, dict) else None
+                shape = tuple(audio.shape) if isinstance(audio, torch.Tensor) else type(audio).__name__
+                logger.info(
+                    "Code2Wav payload received: request_id=%s chunk_id=%d audio_shape=%s "
+                    "finished=%s segment_finished=%s",
+                    req_id,
+                    chunk_id,
+                    shape,
+                    payload_finished,
+                    payload_segment_finished,
+                )
+                self._code2wav_logged_first_payload.add(req_id)
             logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
             return True
 
@@ -446,6 +460,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._evict_finished_active_streams({request_id})
         else:
             self._active_streams.pop(request_id, None)
+        self._code2wav_logged_first_payload.discard(request_id)
         self.finished_requests.discard(request_id)
         self.segment_finished_requests.discard(request_id)
         self.get_req_chunk.pop(request_id, None)
@@ -621,6 +636,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         waiting_queue: Any,
         running_queue: list[Request],
     ) -> None:
+        if len(group) > 1:
+            logger.info(
+                "Code2Wav group released: size=%d requests=%s statuses=%s",
+                len(group),
+                [admission.request.request_id for admission in group],
+                [str(admission.target_status) for admission in group],
+            )
         for admission in group:
             request = admission.request
             request_id = request.request_id
@@ -1005,6 +1027,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         for req_id in request_ids:
             self._code2wav_microbatch.cancel(req_id)
+            self._code2wav_logged_first_payload.discard(req_id)
             self._active_streams.pop(req_id, None)
             self.requests_with_ready_chunks.discard(req_id)
             self.finished_requests.discard(req_id)
