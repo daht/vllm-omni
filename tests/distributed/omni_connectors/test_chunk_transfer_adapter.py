@@ -626,6 +626,17 @@ def test_code2wav_microbatch_holds_then_releases_same_shape(build_adapter):
     assert adapter._code2wav_microbatch.pending_count() == 0
 
 
+def test_code2wav_microbatch_keys_finished_audio(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("finished-audio", RequestStatus.WAITING_FOR_CHUNK)
+    request.additional_information = {
+        "codes": {"audio": torch.ones((4, 2), dtype=torch.long)},
+        "meta": {"finished": torch.tensor(True)},
+    }
+
+    assert adapter._code2wav_chunk_key(request) == ("torch.int64", (4, 2))
+
+
 def test_code2wav_microbatch_restore_skips_pending_abort(build_adapter):
     adapter, _ = build_adapter(
         stage_id=1,

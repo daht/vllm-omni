@@ -596,18 +596,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """Return a conservative shape key for a ready codec payload."""
         info = getattr(request, "additional_information", None)
         meta = info.get("meta") if isinstance(info, dict) else None
-        if isinstance(meta, dict):
-            finished = meta.get("finished")
-            if isinstance(finished, torch.Tensor):
-                finished = bool(finished.item()) if finished.numel() == 1 else False
-            if finished:
-                return None
         codes = info.get("codes") if isinstance(info, dict) else None
         audio = codes.get("audio") if isinstance(codes, dict) else None
         if isinstance(audio, torch.Tensor):
             return (str(audio.dtype), tuple(int(size) for size in audio.shape))
         if isinstance(audio, (list, tuple)) and audio:
             return ("list", len(audio), len(audio[0]) if isinstance(audio[0], (list, tuple)) else 1)
+        # A terminal marker without audio has nothing to batch.
         return None
 
     def _remove_code2wav_pending_request(self, request_id: str) -> None:
