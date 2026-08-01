@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -16,6 +17,7 @@ from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec, stage_receives_chunks
 from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
+from .code2wav_microbatch import Code2WavAdmission, Code2WavMicrobatchScheduler
 
 logger = get_connector_logger(__name__)
 
@@ -93,6 +95,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
+        connector_extra = getattr(self.connector, "config", {}).get("extra", {}) or {}
+        self._code2wav_microbatch = Code2WavMicrobatchScheduler(
+            max_batch_size=connector_extra.get("code2wav_microbatch_max_batch_size", 0),
+            wait_ms=connector_extra.get("code2wav_microbatch_wait_ms", 0),
+        )
+        if self._code2wav_microbatch.enabled:
+            logger.info(
+                "Code2Wav microbatch scheduler enabled: max_batch_size=%d wait_ms=%.3f",
+                self._code2wav_microbatch.max_batch_size,
+                self._code2wav_microbatch.wait_seconds * 1000.0,
+            )
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -403,6 +416,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
+        self._code2wav_microbatch.cancel(request_id)
         if request_id in self.finished_requests:
             self._evict_finished_active_streams({request_id})
         else:
@@ -497,7 +511,29 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_waiting_requests, scheduler_requests)
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_running_requests, scheduler_requests)
 
+        # Release only live requests after the zombie purge. An aborted
+        # request must never be re-injected into the scheduler queues.
+        self._release_due_code2wav_microbatches(waiting_queue, running_queue)
+
         if self._active_window <= 0:
+            if self._code2wav_microbatch.enabled:
+                self._process_chunk_queue(
+                    waiting_queue,
+                    self.waiting_for_chunk_waiting_requests,
+                    RequestStatus.WAITING,
+                    self._finished_load_reqs,
+                    waiting_queue=waiting_queue,
+                    running_queue=running_queue,
+                )
+                self._process_chunk_queue(
+                    running_queue,
+                    self.waiting_for_chunk_running_requests,
+                    RequestStatus.RUNNING,
+                    self._finished_load_reqs,
+                    waiting_queue=waiting_queue,
+                    running_queue=running_queue,
+                )
+                return
             self._process_chunk_queue_legacy(
                 waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
             )
@@ -516,13 +552,92 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._promote_active_streams(running_queue)
         self._promote_active_streams(waiting_queue)
         self._process_chunk_queue(
-            waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
+            waiting_queue,
+            self.waiting_for_chunk_waiting_requests,
+            RequestStatus.WAITING,
+            self._finished_load_reqs,
+            waiting_queue=waiting_queue,
+            running_queue=running_queue,
         )
         self._process_chunk_queue(
-            running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
+            running_queue,
+            self.waiting_for_chunk_running_requests,
+            RequestStatus.RUNNING,
+            self._finished_load_reqs,
+            waiting_queue=waiting_queue,
+            running_queue=running_queue,
         )
         self._promote_active_streams(waiting_queue)
         self._preempt_non_active_running(waiting_queue, running_queue)
+
+    @staticmethod
+    def _code2wav_chunk_key(request: Request) -> tuple[Any, ...] | None:
+        """Return a conservative shape key for a ready codec payload."""
+        info = getattr(request, "additional_information", None)
+        meta = info.get("meta") if isinstance(info, dict) else None
+        if isinstance(meta, dict):
+            finished = meta.get("finished")
+            if isinstance(finished, torch.Tensor):
+                finished = bool(finished.item()) if finished.numel() == 1 else False
+            if finished:
+                return None
+        codes = info.get("codes") if isinstance(info, dict) else None
+        audio = codes.get("audio") if isinstance(codes, dict) else None
+        if isinstance(audio, torch.Tensor):
+            return (str(audio.dtype), tuple(int(size) for size in audio.shape))
+        if isinstance(audio, (list, tuple)) and audio:
+            return ("list", len(audio), len(audio[0]) if isinstance(audio[0], (list, tuple)) else 1)
+        return None
+
+    def _remove_code2wav_pending_request(self, request_id: str) -> None:
+        for parked in (self.waiting_for_chunk_waiting_requests, self.waiting_for_chunk_running_requests):
+            parked_copy = deque(item for item in parked if item.request_id != request_id)
+            parked.clear()
+            parked.extend(parked_copy)
+
+    def _release_code2wav_group(
+        self,
+        group: list[Code2WavAdmission],
+        waiting_queue: Any,
+        running_queue: list[Request],
+    ) -> None:
+        for admission in group:
+            request = admission.request
+            request_id = request.request_id
+            self._remove_code2wav_pending_request(request_id)
+            request.status = admission.target_status
+            self.requests_with_ready_chunks.add(request_id)
+            self.requests_origin_status[request_id] = admission.target_status
+            if admission.target_status == RequestStatus.WAITING:
+                waiting_queue.add_request(request)
+            else:
+                running_queue.append(request)
+
+    def _release_due_code2wav_microbatches(self, waiting_queue: Any, running_queue: list[Request]) -> None:
+        for group in self._code2wav_microbatch.poll(time.monotonic()):
+            self._release_code2wav_group(group, waiting_queue, running_queue)
+
+    def _offer_code2wav_chunk(
+        self,
+        request: Request,
+        target_status: RequestStatus,
+        waiting_for_chunk_list: deque[Any],
+        waiting_queue: Any,
+        running_queue: list[Request],
+    ) -> None:
+        key = self._code2wav_chunk_key(request)
+        if key is None or not self._code2wav_microbatch.enabled:
+            self._release_code2wav_group(
+                [Code2WavAdmission(request, target_status)],
+                waiting_queue,
+                running_queue,
+            )
+            return
+        group = self._code2wav_microbatch.offer(request, target_status, key, time.monotonic())
+        if group:
+            self._release_code2wav_group(group, waiting_queue, running_queue)
+            return
+        waiting_for_chunk_list.append(request)
 
     def _evict_finished_active_streams(self, request_ids: set[str] | None = None) -> None:
         for request_id in list(self._active_streams):
@@ -661,19 +776,29 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_waiting_requests, scheduler_requests)
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_running_requests, scheduler_requests)
         # Add request waiting for chunk to the waiting and running queue
+        remaining_waiting: deque[Any] = deque()
         for request in self.waiting_for_chunk_waiting_requests:
-            if scheduler_requests is None or request.request_id in scheduler_requests:
+            live = scheduler_requests is None or request.request_id in scheduler_requests
+            if not live:
+                self.cleanup_receiver(request.request_id)
+            elif self._code2wav_microbatch.contains(request.request_id):
+                remaining_waiting.append(request)
+            else:
                 waiting_queue.add_request(request)
-        self.waiting_for_chunk_waiting_requests = deque()
+        self.waiting_for_chunk_waiting_requests = remaining_waiting
 
         if self.waiting_for_chunk_running_requests:
-            live_running_requests = [
-                request
-                for request in self.waiting_for_chunk_running_requests
-                if scheduler_requests is None or request.request_id in scheduler_requests
-            ]
+            live_running_requests = []
+            remaining_running: deque[Any] = deque()
+            for request in self.waiting_for_chunk_running_requests:
+                if scheduler_requests is not None and request.request_id not in scheduler_requests:
+                    self.cleanup_receiver(request.request_id)
+                elif self._code2wav_microbatch.contains(request.request_id):
+                    remaining_running.append(request)
+                else:
+                    live_running_requests.append(request)
             running_queue.extend(live_running_requests)
-        self.waiting_for_chunk_running_requests = deque()
+            self.waiting_for_chunk_running_requests = remaining_running
 
         if self._held_non_active:
             running_queue.extend(self._held_non_active)
@@ -737,6 +862,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         waiting_for_chunk_list: deque[Any],
         target_status: RequestStatus,
         finished_load_reqs: set[str],
+        *,
+        waiting_queue: Any | None = None,
+        running_queue: list[Request] | None = None,
     ) -> None:
         queue_snapshot = list(queue)
         for request in queue_snapshot:
@@ -763,9 +891,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 request.status = RequestStatus.WAITING_FOR_CHUNK
             else:
                 if request.request_id in finished_load_reqs:
-                    request.status = target_status
                     finished_load_reqs.remove(request.request_id)
-                    self.requests_with_ready_chunks.add(request.request_id)
+                    if waiting_queue is not None and running_queue is not None:
+                        queue.remove(request)
+                        self.requests_origin_status[request.request_id] = target_status
+                        self._offer_code2wav_chunk(
+                            request,
+                            target_status,
+                            waiting_for_chunk_list,
+                            waiting_queue,
+                            running_queue,
+                        )
                     continue
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
@@ -815,6 +951,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
 
         for req_id in request_ids:
+            self._code2wav_microbatch.cancel(req_id)
             self._active_streams.pop(req_id, None)
             self.requests_with_ready_chunks.discard(req_id)
             self.finished_requests.discard(req_id)

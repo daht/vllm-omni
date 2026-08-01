@@ -18,6 +18,9 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTran
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from vllm_omni.distributed.omni_connectors.transfer_adapter.code2wav_microbatch import (
+    Code2WavMicrobatchScheduler,
+)
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -29,6 +32,57 @@ class DummyWaitingQueue(list):
 
     def add_request(self, request):
         self.append(request)
+
+
+def test_code2wav_microbatch_scheduler_disabled_is_immediate():
+    scheduler = Code2WavMicrobatchScheduler(max_batch_size=2, wait_ms=0)
+    request = SimpleNamespace(request_id="r1")
+
+    group = scheduler.offer(request, RequestStatus.WAITING, ("float", (1, 2)), 0.0)
+
+    assert [item.request for item in group] == [request]
+    assert scheduler.pending_count() == 0
+
+
+def test_code2wav_microbatch_scheduler_matches_same_key():
+    scheduler = Code2WavMicrobatchScheduler(max_batch_size=2, wait_ms=10)
+    first = SimpleNamespace(request_id="r1")
+    second = SimpleNamespace(request_id="r2")
+
+    assert scheduler.offer(first, RequestStatus.WAITING, ("long", (2, 4)), 1.0) == []
+    group = scheduler.offer(second, RequestStatus.RUNNING, ("long", (2, 4)), 1.001)
+
+    assert [item.request for item in group] == [first, second]
+    assert [item.target_status for item in group] == [RequestStatus.WAITING, RequestStatus.RUNNING]
+    assert scheduler.pending_count() == 0
+
+
+def test_code2wav_microbatch_scheduler_deadline_and_cancel():
+    scheduler = Code2WavMicrobatchScheduler(max_batch_size=2, wait_ms=10)
+    first = SimpleNamespace(request_id="r1")
+    second = SimpleNamespace(request_id="r2")
+
+    scheduler.offer(first, RequestStatus.WAITING, "a", 1.0)
+    scheduler.offer(second, RequestStatus.WAITING, "b", 1.0)
+    scheduler.cancel("r2")
+
+    groups = scheduler.poll(1.011)
+
+    assert [[item.request for item in group] for group in groups] == [[first]]
+    assert scheduler.pending_count() == 0
+
+
+def test_code2wav_microbatch_scheduler_does_not_mix_keys():
+    scheduler = Code2WavMicrobatchScheduler(max_batch_size=2, wait_ms=10)
+    first = SimpleNamespace(request_id="r1")
+    second = SimpleNamespace(request_id="r2")
+
+    scheduler.offer(first, RequestStatus.WAITING, "a", 1.0)
+    scheduler.offer(second, RequestStatus.WAITING, "b", 1.0)
+
+    groups = scheduler.poll(1.011)
+
+    assert [[item.request for item in group] for group in groups] == [[first], [second]]
 
 
 def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None):
@@ -524,6 +578,64 @@ def test_process_and_restore_queues(build_adapter):
     assert running_queue == [running_req]
     assert adapter.waiting_for_chunk_waiting_requests == deque()
     assert adapter.waiting_for_chunk_running_requests == deque()
+
+
+def test_code2wav_microbatch_holds_then_releases_same_shape(build_adapter):
+    adapter, _ = build_adapter(
+        stage_id=1,
+        connector_extra={
+            "code2wav_microbatch_max_batch_size": 2,
+            "code2wav_microbatch_wait_ms": 10,
+        },
+    )
+    first = _req("first", RequestStatus.WAITING_FOR_CHUNK)
+    second = _req("second", RequestStatus.WAITING_FOR_CHUNK)
+    for request in (first, second):
+        request.additional_information = {
+            "codes": {"audio": torch.ones((4, 2), dtype=torch.long)},
+            "meta": {"finished": torch.tensor(False)},
+        }
+    waiting_queue = DummyWaitingQueue([first])
+    running_queue = []
+    adapter._finished_load_reqs.add(first.request_id)
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+    assert waiting_queue == []
+    assert list(adapter.waiting_for_chunk_waiting_requests) == [first]
+    assert adapter._code2wav_microbatch.pending_count() == 1
+
+    adapter.restore_queues(waiting_queue, running_queue)
+    assert list(adapter.waiting_for_chunk_waiting_requests) == [first]
+
+    waiting_queue.append(second)
+    adapter._finished_load_reqs.add(second.request_id)
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert waiting_queue == [first, second]
+    assert first.request_id in adapter.requests_with_ready_chunks
+    assert second.request_id in adapter.requests_with_ready_chunks
+    assert adapter._code2wav_microbatch.pending_count() == 0
+
+
+def test_code2wav_microbatch_restore_skips_pending_abort(build_adapter):
+    adapter, _ = build_adapter(
+        stage_id=1,
+        connector_extra={
+            "code2wav_microbatch_max_batch_size": 2,
+            "code2wav_microbatch_wait_ms": 10,
+        },
+    )
+    request = _req("pending", RequestStatus.WAITING_FOR_CHUNK)
+    request.additional_information = {"codes": {"audio": torch.ones((4, 2), dtype=torch.long)}}
+    adapter.waiting_for_chunk_waiting_requests.append(request)
+    adapter._code2wav_microbatch.offer(request, RequestStatus.WAITING, ("long", (4, 2)), 0.0)
+    waiting_queue = DummyWaitingQueue()
+    running_queue = []
+
+    adapter.restore_queues(waiting_queue, running_queue)
+
+    assert waiting_queue == []
+    assert list(adapter.waiting_for_chunk_waiting_requests) == [request]
 
 
 def test_fifo_promotion(build_adapter):
