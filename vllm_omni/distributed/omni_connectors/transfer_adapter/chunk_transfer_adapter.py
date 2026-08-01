@@ -113,6 +113,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         self._code2wav_stats_next_log = self._code2wav_stats_log_every
         self._code2wav_stats_ticks = 0
+        self._code2wav_load_completions = 0
+        self._code2wav_ready_for_admission = 0
+        self._code2wav_bypassed_no_audio = 0
         if self._code2wav_microbatch.enabled:
             logger.info(
                 "Code2Wav microbatch scheduler enabled: max_batch_size=%d wait_ms=%.3f",
@@ -330,6 +333,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
+            self._code2wav_load_completions += 1
             logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
             return True
 
@@ -645,7 +649,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         logger.info(
             "Code2Wav scheduler stats: offers=%d pending=%d matched_b2=%d "
             "matched_requests=%d deadline_b1=%d deadline_requests=%d "
-            "key_mismatch=%d cancelled=%d max_ready_skew_ms=%.3f",
+            "key_mismatch=%d cancelled=%d max_ready_skew_ms=%.3f "
+            "load_complete=%d ready_for_admission=%d bypass_no_audio=%d",
             offers,
             stats["pending"],
             stats["matched_b2"],
@@ -655,6 +660,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             stats["key_mismatch"],
             stats["cancelled"],
             stats["max_ready_skew_ms"],
+            self._code2wav_load_completions,
+            self._code2wav_ready_for_admission,
+            self._code2wav_bypassed_no_audio,
         )
         self._code2wav_stats_next_log = self._code2wav_stats_ticks + self._code2wav_stats_log_every
 
@@ -668,6 +676,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     ) -> None:
         key = self._code2wav_chunk_key(request)
         if key is None or not self._code2wav_microbatch.enabled:
+            if key is None:
+                self._code2wav_bypassed_no_audio += 1
             self._release_code2wav_group(
                 [Code2WavAdmission(request, target_status)],
                 waiting_queue,
@@ -937,6 +947,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     if waiting_queue is not None and running_queue is not None:
                         queue.remove(request)
                         self.requests_origin_status[request.request_id] = target_status
+                        self._code2wav_ready_for_admission += 1
                         self._offer_code2wav_chunk(
                             request,
                             target_status,
