@@ -55,6 +55,11 @@ def test_code2wav_microbatch_scheduler_matches_same_key():
     assert [item.request for item in group] == [first, second]
     assert [item.target_status for item in group] == [RequestStatus.WAITING, RequestStatus.RUNNING]
     assert scheduler.pending_count() == 0
+    stats = scheduler.stats_snapshot()
+    assert stats["offers"] == 2
+    assert stats["matched_b2"] == 1
+    assert stats["matched_requests"] == 2
+    assert stats["max_ready_skew_ms"] == pytest.approx(1.0)
 
 
 def test_code2wav_microbatch_scheduler_deadline_and_cancel():
@@ -70,6 +75,10 @@ def test_code2wav_microbatch_scheduler_deadline_and_cancel():
 
     assert [[item.request for item in group] for group in groups] == [[first]]
     assert scheduler.pending_count() == 0
+    stats = scheduler.stats_snapshot()
+    assert stats["deadline_b1"] == 1
+    assert stats["deadline_requests"] == 1
+    assert stats["cancelled"] == 1
 
 
 def test_code2wav_microbatch_scheduler_does_not_mix_keys():

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
@@ -106,6 +107,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             max_batch_size=connector_extra.get("code2wav_microbatch_max_batch_size", 0),
             wait_ms=connector_extra.get("code2wav_microbatch_wait_ms", 0),
         )
+        self._code2wav_stats_log_every = max(
+            0,
+            int(os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_SCHEDULER_STATS_LOG_EVERY", "0") or 0),
+        )
+        self._code2wav_stats_next_log = self._code2wav_stats_log_every
         if self._code2wav_microbatch.enabled:
             logger.info(
                 "Code2Wav microbatch scheduler enabled: max_batch_size=%d wait_ms=%.3f",
@@ -622,6 +628,30 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def _release_due_code2wav_microbatches(self, waiting_queue: Any, running_queue: list[Request]) -> None:
         for group in self._code2wav_microbatch.poll(time.monotonic()):
             self._release_code2wav_group(group, waiting_queue, running_queue)
+        self._log_code2wav_scheduler_stats()
+
+    def _log_code2wav_scheduler_stats(self) -> None:
+        if not self._code2wav_microbatch.enabled or self._code2wav_stats_log_every <= 0:
+            return
+        stats = self._code2wav_microbatch.stats_snapshot()
+        offers = int(stats["offers"])
+        if offers < self._code2wav_stats_next_log:
+            return
+        logger.info(
+            "Code2Wav scheduler stats: offers=%d pending=%d matched_b2=%d "
+            "matched_requests=%d deadline_b1=%d deadline_requests=%d "
+            "key_mismatch=%d cancelled=%d max_ready_skew_ms=%.3f",
+            offers,
+            stats["pending"],
+            stats["matched_b2"],
+            stats["matched_requests"],
+            stats["deadline_b1"],
+            stats["deadline_requests"],
+            stats["key_mismatch"],
+            stats["cancelled"],
+            stats["max_ready_skew_ms"],
+        )
+        self._code2wav_stats_next_log = offers + self._code2wav_stats_log_every
 
     def _offer_code2wav_chunk(
         self,
@@ -640,6 +670,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             )
             return
         group = self._code2wav_microbatch.offer(request, target_status, key, time.monotonic())
+        self._log_code2wav_scheduler_stats()
         if group:
             self._release_code2wav_group(group, waiting_queue, running_queue)
             return
