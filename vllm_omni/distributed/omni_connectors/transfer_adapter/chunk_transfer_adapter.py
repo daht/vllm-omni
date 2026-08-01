@@ -118,6 +118,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 self._code2wav_microbatch.max_batch_size,
                 self._code2wav_microbatch.wait_seconds * 1000.0,
             )
+        else:
+            logger.info(
+                "Code2Wav microbatch scheduler disabled: max_batch_size=%d wait_ms=%.3f "
+                "connector_extra_keys=%s",
+                self._code2wav_microbatch.max_batch_size,
+                self._code2wav_microbatch.wait_seconds * 1000.0,
+                sorted(str(key) for key in connector_extra),
+            )
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
