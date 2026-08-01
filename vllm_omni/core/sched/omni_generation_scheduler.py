@@ -130,6 +130,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self.chunk_transfer_adapter is not None and self.chunk_transfer_adapter.is_done_receiving_chunks(
                     request.request_id
                 ):
+                    logger.info(
+                        "Code2Wav pending finish scheduled: request_id=%s status=%s "
+                        "computed_tokens=%d prompt_tokens=%d",
+                        request.request_id,
+                        request.status,
+                        request.num_computed_tokens,
+                        len(request.prompt_token_ids),
+                    )
                     self._pending_finish_reqs.append(request)
                 req_index += 1
                 continue
@@ -526,6 +534,17 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     and request.num_computed_tokens >= len(request.prompt_token_ids)
                 )
             ):
+                if self.chunk_transfer_adapter is not None and self.chunk_transfer_adapter.is_done_receiving_chunks(
+                    request.request_id
+                ):
+                    logger.info(
+                        "Code2Wav finish after model output: request_id=%s status=%s "
+                        "computed_tokens=%d prompt_tokens=%d",
+                        request.request_id,
+                        request.status,
+                        request.num_computed_tokens,
+                        len(request.prompt_token_ids),
+                    )
                 request.status = RequestStatus.FINISHED_STOPPED
                 # Optional: set a stop_reason for front-end clarity
                 # (does not affect protocol)
@@ -602,6 +621,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         for request in self._pending_finish_reqs:
             if request.is_finished():
                 continue
+            logger.info(
+                "Code2Wav pending finish emitted: request_id=%s status=%s "
+                "computed_tokens=%d prompt_tokens=%d",
+                request.request_id,
+                request.status,
+                request.num_computed_tokens,
+                len(request.prompt_token_ids),
+            )
             request.status = RequestStatus.FINISHED_STOPPED
             finish_reason = request.get_finished_reason()
             finished = self._handle_stopped_request(request)
