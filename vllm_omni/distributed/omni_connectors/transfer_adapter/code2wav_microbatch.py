@@ -99,6 +99,13 @@ class Code2WavMicrobatchScheduler:
         if not self._pending[key]:
             self._pending.pop(key, None)
 
+    def release_pending(self, request_id: str) -> list[Code2WavAdmission]:
+        """Release the request's compatible pending group as a B=1 deadline."""
+        key = self._request_keys.get(str(request_id))
+        if key is None:
+            return []
+        return self._pop_group(key, matched=False)
+
     def contains(self, request_id: str) -> bool:
         return str(request_id) in self._request_keys
 

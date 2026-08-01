@@ -757,7 +757,32 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if group:
             self._release_code2wav_group(group, waiting_queue, running_queue)
             return
+        if not self._has_code2wav_peer(request.request_id, waiting_queue, running_queue):
+            group = self._code2wav_microbatch.release_pending(request.request_id)
+            if group:
+                logger.info(
+                    "Code2Wav singleton released without peer: request_id=%s",
+                    request.request_id,
+                )
+                self._release_code2wav_group(group, waiting_queue, running_queue)
+                return
         waiting_for_chunk_list.append(request)
+
+    def _has_code2wav_peer(self, request_id: str, waiting_queue: Any, running_queue: list[Request]) -> bool:
+        """Whether another live Stage 1 request can trigger a scheduler tick."""
+        candidates = [
+            *waiting_queue,
+            *running_queue,
+            *self.waiting_for_chunk_waiting_requests,
+            *self.waiting_for_chunk_running_requests,
+            *self._held_non_active,
+        ]
+        return any(
+            candidate.request_id != request_id
+            and candidate.request_id not in self.finished_requests
+            and candidate.request_id not in self.segment_finished_requests
+            for candidate in candidates
+        )
 
     def _evict_finished_active_streams(self, request_ids: set[str] | None = None) -> None:
         for request_id in list(self._active_streams):

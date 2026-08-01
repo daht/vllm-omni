@@ -81,6 +81,21 @@ def test_code2wav_microbatch_scheduler_deadline_and_cancel():
     assert stats["cancelled"] == 1
 
 
+def test_code2wav_microbatch_scheduler_releases_single_pending_request():
+    scheduler = Code2WavMicrobatchScheduler(max_batch_size=2, wait_ms=10)
+    request = SimpleNamespace(request_id="r1")
+
+    assert scheduler.offer(request, RequestStatus.RUNNING, "a", 1.0) == []
+
+    group = scheduler.release_pending("r1")
+
+    assert [item.request for item in group] == [request]
+    assert scheduler.pending_count() == 0
+    stats = scheduler.stats_snapshot()
+    assert stats["deadline_b1"] == 1
+    assert stats["deadline_requests"] == 1
+
+
 def test_code2wav_microbatch_scheduler_does_not_mix_keys():
     scheduler = Code2WavMicrobatchScheduler(max_batch_size=2, wait_ms=10)
     first = SimpleNamespace(request_id="r1")
