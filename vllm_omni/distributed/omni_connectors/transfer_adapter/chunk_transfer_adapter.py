@@ -95,7 +95,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
-        connector_extra = getattr(self.connector, "config", {}).get("extra", {}) or {}
+        connector_config = getattr(self.connector, "config", {}) or {}
+        if isinstance(connector_config, Mapping) and isinstance(connector_config.get("extra"), Mapping):
+            connector_extra = connector_config["extra"]
+        elif isinstance(connector_config, Mapping):
+            connector_extra = connector_config
+        else:
+            connector_extra = {}
         self._code2wav_microbatch = Code2WavMicrobatchScheduler(
             max_batch_size=connector_extra.get("code2wav_microbatch_max_batch_size", 0),
             wait_ms=connector_extra.get("code2wav_microbatch_wait_ms", 0),
