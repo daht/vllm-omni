@@ -340,10 +340,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 audio = payload_data.get("codes", {}).get("audio") if isinstance(payload_data, dict) else None
                 shape = tuple(audio.shape) if isinstance(audio, torch.Tensor) else type(audio).__name__
                 logger.info(
-                    "Code2Wav payload received: request_id=%s chunk_id=%d audio_shape=%s "
+                    "Code2Wav payload received: request_id=%s chunk_id=%d get_key=%s audio_shape=%s "
                     "finished=%s segment_finished=%s",
                     req_id,
                     chunk_id,
+                    connector_get_key,
                     shape,
                     payload_finished,
                     payload_segment_finished,
@@ -419,10 +420,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 audio = codes.get("audio") if isinstance(codes, dict) else getattr(codes, "audio", None)
                 shape = tuple(audio.shape) if isinstance(audio, torch.Tensor) else type(audio).__name__
                 logger.info(
-                    "Code2Wav payload sent: request_id=%s chunk_id=%d audio_shape=%s "
+                    "Code2Wav payload sent: request_id=%s chunk_id=%d put_key=%s audio_shape=%s "
                     "finished=%s segment_finished=%s",
                     request.request_id,
                     chunk_id,
+                    connector_put_key,
                     shape,
                     is_payload_finished,
                     is_segment_finished,
