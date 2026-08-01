@@ -117,6 +117,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._code2wav_ready_for_admission = 0
         self._code2wav_bypassed_no_audio = 0
         self._code2wav_logged_first_payload: set[str] = set()
+        self._code2wav_logged_first_send: set[str] = set()
         if self._code2wav_microbatch.enabled:
             logger.info(
                 "Code2Wav microbatch scheduler enabled: max_batch_size=%d wait_ms=%.3f",
@@ -407,19 +408,32 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if success:
             self.put_req_chunk[external_req_id] += 1
             self.ramp_chunk_count[external_req_id] += 1
-            logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
-            # Sender uses struct attr access here; the receive path in
-            # `_load_one_request` / `_update_request_payload` reads dict keys.
-            # That asymmetry is intentional: `OmniMsgpackDecoder` is type-erased
-            # (no target type), so the wire round-trips struct -> dict. If you
-            # change the schema, update both ends — see test_wire_round_trip.
             finished_flag = payload_data.meta.finished if payload_data.meta is not None else None
             is_payload_finished = False
             if isinstance(finished_flag, torch.Tensor):
                 is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())
             elif finished_flag is not None:
                 is_payload_finished = bool(finished_flag)
-
+            if request.request_id not in self._code2wav_logged_first_send or is_payload_finished:
+                codes = getattr(payload_data, "codes", None)
+                audio = codes.get("audio") if isinstance(codes, dict) else getattr(codes, "audio", None)
+                shape = tuple(audio.shape) if isinstance(audio, torch.Tensor) else type(audio).__name__
+                logger.info(
+                    "Code2Wav payload sent: request_id=%s chunk_id=%d audio_shape=%s "
+                    "finished=%s segment_finished=%s",
+                    request.request_id,
+                    chunk_id,
+                    shape,
+                    is_payload_finished,
+                    is_segment_finished,
+                )
+                self._code2wav_logged_first_send.add(request.request_id)
+            logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+            # Sender uses struct attr access here; the receive path in
+            # `_load_one_request` / `_update_request_payload` reads dict keys.
+            # That asymmetry is intentional: `OmniMsgpackDecoder` is type-erased
+            # (no target type), so the wire round-trips struct -> dict. If you
+            # change the schema, update both ends — see test_wire_round_trip.
             # Reclaim per-request async state only after the terminal payload
             # has been sent successfully. This avoids cleanup->save races.
             if is_payload_finished:
@@ -456,6 +470,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
         self._code2wav_microbatch.cancel(request_id)
+        self._code2wav_logged_first_send.discard(request_id)
         if request_id in self.finished_requests:
             self._evict_finished_active_streams({request_id})
         else:
@@ -1028,6 +1043,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         for req_id in request_ids:
             self._code2wav_microbatch.cancel(req_id)
             self._code2wav_logged_first_payload.discard(req_id)
+            self._code2wav_logged_first_send.discard(req_id)
             self._active_streams.pop(req_id, None)
             self.requests_with_ready_chunks.discard(req_id)
             self.finished_requests.discard(req_id)
