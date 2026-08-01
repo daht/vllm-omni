@@ -109,7 +109,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         self._code2wav_stats_log_every = max(
             0,
-            int(os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_SCHEDULER_STATS_LOG_EVERY", "0") or 0),
+            int(os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_SCHEDULER_STATS_LOG_EVERY", "100") or 100),
         )
         self._code2wav_stats_next_log = self._code2wav_stats_log_every
         if self._code2wav_microbatch.enabled:
