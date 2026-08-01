@@ -118,6 +118,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._code2wav_bypassed_no_audio = 0
         self._code2wav_logged_first_payload: set[str] = set()
         self._code2wav_logged_first_send: set[str] = set()
+        self._code2wav_poll_misses: dict[str, int] = defaultdict(int)
         if self._code2wav_microbatch.enabled:
             logger.info(
                 "Code2Wav microbatch scheduler enabled: max_batch_size=%d wait_ms=%.3f",
@@ -256,8 +257,25 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return False
 
         if result is None:
+            if self._code2wav_microbatch.enabled:
+                misses = self._code2wav_poll_misses[req_id] + 1
+                self._code2wav_poll_misses[req_id] = misses
+                if misses in (1, 10, 100, 1000):
+                    logger.info(
+                        "Code2Wav poll miss: request_id=%s expected_chunk=%d "
+                        "get_key=%s misses=%d status=%s finished=%s segment_finished=%s",
+                        req_id,
+                        chunk_id,
+                        connector_get_key,
+                        misses,
+                        request.status,
+                        req_id in self.finished_requests,
+                        req_id in self.segment_finished_requests,
+                    )
             return False
         payload_data, size = result
+        if self._code2wav_microbatch.enabled:
+            self._code2wav_poll_misses.pop(req_id, None)
 
         if payload_data:
             # Update connector state
@@ -472,7 +490,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
         self._code2wav_microbatch.cancel(request_id)
+        logger.info(
+            "Code2Wav cleanup receiver: request_id=%s get_req_chunk=%s "
+            "finished=%s segment_finished=%s ready=%s cancelled_load=%s",
+            request_id,
+            self.get_req_chunk.get(request_id),
+            request_id in self.finished_requests,
+            request_id in self.segment_finished_requests,
+            request_id in self.requests_with_ready_chunks,
+            request_id in self._cancelled_load_reqs,
+        )
         self._code2wav_logged_first_send.discard(request_id)
+        self._code2wav_poll_misses.pop(request_id, None)
         if request_id in self.finished_requests:
             self._evict_finished_active_streams({request_id})
         else:
@@ -801,6 +830,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # of schedule, but have not scheduled
                     continue
                 if self.is_done_receiving_chunks(request.request_id):
+                    logger.info(
+                        "Code2Wav queue skip done: request_id=%s status=%s get_req_chunk=%s "
+                        "finished=%s segment_finished=%s",
+                        request.request_id,
+                        request.status,
+                        self.get_req_chunk.get(request.request_id),
+                        request.request_id in self.finished_requests,
+                        request.request_id in self.segment_finished_requests,
+                    )
                     request.additional_information = None
                     continue
                 # Requests that waiting for chunk
@@ -814,6 +852,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     continue
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
+            if self._code2wav_microbatch.enabled:
+                logger.info(
+                    "Code2Wav queue parked: request_id=%s target_status=%s "
+                    "get_req_chunk=%s queue=%s",
+                    request.request_id,
+                    target_status,
+                    self.get_req_chunk.get(request.request_id),
+                    type(waiting_for_chunk_list).__name__,
+                )
             waiting_for_chunk_list.append(request)
 
     def _purge_untracked_chunk_requests(
@@ -1043,6 +1090,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
 
         for req_id in request_ids:
+            if self._code2wav_microbatch.enabled:
+                logger.info(
+                    "Code2Wav finish request: request_id=%s status=%s get_req_chunk=%s "
+                    "finished=%s segment_finished=%s ready=%s",
+                    req_id,
+                    requests.get(req_id).status if requests and requests.get(req_id) else None,
+                    self.get_req_chunk.get(req_id),
+                    req_id in self.finished_requests,
+                    req_id in self.segment_finished_requests,
+                    req_id in self.requests_with_ready_chunks,
+                )
             self._code2wav_microbatch.cancel(req_id)
             self._code2wav_logged_first_payload.discard(req_id)
             self._code2wav_logged_first_send.discard(req_id)
@@ -1051,5 +1109,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.finished_requests.discard(req_id)
             self._finished_load_reqs.discard(req_id)
             self._cancelled_load_reqs.add(req_id)
+            self._code2wav_poll_misses.pop(req_id, None)
 
         return []
