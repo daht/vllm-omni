@@ -663,6 +663,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         meta = info.get("meta") if isinstance(info, dict) else None
         codes = info.get("codes") if isinstance(info, dict) else None
         audio = codes.get("audio") if isinstance(codes, dict) else None
+        if isinstance(meta, dict) and bool(meta.get("finished", False)):
+            # A terminal chunk must make progress even when its remaining
+            # peers have different tail lengths and cannot form a batch.
+            return None
         if isinstance(audio, torch.Tensor):
             return (str(audio.dtype), tuple(int(size) for size in audio.shape))
         if isinstance(audio, (list, tuple)) and audio:
@@ -761,7 +765,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             group = self._code2wav_microbatch.release_pending(request.request_id)
             if group:
                 logger.info(
-                    "Code2Wav singleton released without peer: request_id=%s",
+                    "Code2Wav pending group released without peer: request_id=%s",
                     request.request_id,
                 )
                 self._release_code2wav_group(group, waiting_queue, running_queue)

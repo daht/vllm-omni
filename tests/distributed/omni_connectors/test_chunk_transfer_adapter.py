@@ -604,17 +604,19 @@ def test_process_and_restore_queues(build_adapter):
     assert adapter.waiting_for_chunk_running_requests == deque()
 
 
-def test_code2wav_microbatch_holds_then_releases_same_shape(build_adapter):
+def test_code2wav_microbatch_holds_then_releases_four_same_shape(build_adapter):
     adapter, _ = build_adapter(
         stage_id=1,
         connector_extra={
-            "code2wav_microbatch_max_batch_size": 2,
+            "code2wav_microbatch_max_batch_size": 4,
             "code2wav_microbatch_wait_ms": 10,
         },
     )
     first = _req("first", RequestStatus.WAITING_FOR_CHUNK)
     second = _req("second", RequestStatus.WAITING_FOR_CHUNK)
-    for request in (first, second):
+    third = _req("third", RequestStatus.WAITING_FOR_CHUNK)
+    fourth = _req("fourth", RequestStatus.WAITING_FOR_CHUNK)
+    for request in (first, second, third, fourth):
         request.additional_information = {
             "codes": {"audio": torch.ones((4, 2), dtype=torch.long)},
             "meta": {"finished": torch.tensor(False)},
@@ -631,13 +633,44 @@ def test_code2wav_microbatch_holds_then_releases_same_shape(build_adapter):
     adapter.restore_queues(waiting_queue, running_queue)
     assert list(adapter.waiting_for_chunk_waiting_requests) == [first]
 
-    waiting_queue.append(second)
-    adapter._finished_load_reqs.add(second.request_id)
+    for request in (second, third, fourth):
+        waiting_queue.append(request)
+        adapter._finished_load_reqs.add(request.request_id)
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
-    assert waiting_queue == [first, second]
-    assert first.request_id in adapter.requests_with_ready_chunks
-    assert second.request_id in adapter.requests_with_ready_chunks
+    assert waiting_queue == [first, second, third, fourth]
+    for request in (first, second, third, fourth):
+        assert request.request_id in adapter.requests_with_ready_chunks
+    assert adapter._code2wav_microbatch.pending_count() == 0
+
+
+def test_code2wav_microbatch_releases_terminal_audio_without_waiting_for_peers(build_adapter):
+    adapter, _ = build_adapter(
+        stage_id=1,
+        connector_extra={
+            "code2wav_microbatch_max_batch_size": 4,
+            "code2wav_microbatch_wait_ms": 10,
+        },
+    )
+    terminal = _req("terminal", RequestStatus.WAITING_FOR_CHUNK)
+    terminal.additional_information = {
+        "codes": {"audio": torch.ones((4, 2), dtype=torch.long)},
+        "meta": {"finished": torch.tensor(True)},
+    }
+    peer = _req("peer", RequestStatus.RUNNING)
+    waiting_queue = DummyWaitingQueue([peer])
+    running_queue = []
+
+    adapter._offer_code2wav_chunk(
+        terminal,
+        RequestStatus.WAITING,
+        adapter.waiting_for_chunk_waiting_requests,
+        waiting_queue,
+        running_queue,
+    )
+
+    assert waiting_queue == [peer, terminal]
+    assert terminal.request_id in adapter.requests_with_ready_chunks
     assert adapter._code2wav_microbatch.pending_count() == 0
 
 
@@ -649,7 +682,7 @@ def test_code2wav_microbatch_keys_finished_audio(build_adapter):
         "meta": {"finished": torch.tensor(True)},
     }
 
-    assert adapter._code2wav_chunk_key(request) == ("torch.int64", (4, 2))
+    assert adapter._code2wav_chunk_key(request) is None
 
 
 def test_code2wav_microbatch_keys_list_audio(build_adapter):
