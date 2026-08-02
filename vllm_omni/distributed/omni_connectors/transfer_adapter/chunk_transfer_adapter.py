@@ -119,6 +119,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._code2wav_logged_first_payload: set[str] = set()
         self._code2wav_logged_first_send: set[str] = set()
         self._code2wav_poll_misses: dict[str, int] = defaultdict(int)
+        self._code2wav_gap_trace_ms = max(
+            0.0,
+            float(os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_GAP_TRACE_MS", "0") or 0),
+        )
+        self._code2wav_last_send_at: dict[str, float] = {}
+        self._code2wav_last_receive_at: dict[str, float] = {}
+        self._code2wav_received_at: dict[str, float] = {}
         if self._code2wav_microbatch.enabled:
             logger.info(
                 "Code2Wav microbatch scheduler enabled: max_batch_size=%d wait_ms=%.3f",
@@ -132,6 +139,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 self._code2wav_microbatch.max_batch_size,
                 self._code2wav_microbatch.wait_seconds * 1000.0,
                 sorted(str(key) for key in connector_extra),
+            )
+        if self._code2wav_gap_trace_ms:
+            logger.info(
+                "Code2Wav gap tracing enabled: threshold_ms=%.3f",
+                self._code2wav_gap_trace_ms,
             )
 
     @staticmethod
@@ -354,6 +366,28 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
             self._code2wav_load_completions += 1
+            if self._code2wav_gap_trace_ms:
+                received_at = time.monotonic()
+                previous_received_at = self._code2wav_last_receive_at.get(req_id)
+                self._code2wav_last_receive_at[req_id] = received_at
+                self._code2wav_received_at[req_id] = received_at
+                receive_gap_ms = (
+                    (received_at - previous_received_at) * 1000.0
+                    if previous_received_at is not None
+                    else 0.0
+                )
+                if receive_gap_ms >= self._code2wav_gap_trace_ms:
+                    audio = payload_data.get("codes", {}).get("audio") if isinstance(payload_data, dict) else None
+                    shape = tuple(audio.shape) if isinstance(audio, torch.Tensor) else type(audio).__name__
+                    logger.info(
+                        "Code2Wav gap trace: stage=%d event=payload_received request_id=%s "
+                        "chunk_id=%d gap_ms=%.3f audio_shape=%s",
+                        stage_id,
+                        req_id,
+                        chunk_id,
+                        receive_gap_ms,
+                        shape,
+                    )
             if req_id not in self._code2wav_logged_first_payload or payload_finished or payload_segment_finished:
                 audio = payload_data.get("codes", {}).get("audio") if isinstance(payload_data, dict) else None
                 shape = tuple(audio.shape) if isinstance(audio, torch.Tensor) else type(audio).__name__
@@ -448,6 +482,24 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     is_segment_finished,
                 )
                 self._code2wav_logged_first_send.add(request.request_id)
+            if self._code2wav_gap_trace_ms:
+                sent_at = time.monotonic()
+                previous_sent_at = self._code2wav_last_send_at.get(request.request_id)
+                self._code2wav_last_send_at[request.request_id] = sent_at
+                send_gap_ms = (
+                    (sent_at - previous_sent_at) * 1000.0
+                    if previous_sent_at is not None
+                    else 0.0
+                )
+                if send_gap_ms >= self._code2wav_gap_trace_ms:
+                    logger.info(
+                        "Code2Wav gap trace: stage=%d event=payload_sent request_id=%s "
+                        "chunk_id=%d gap_ms=%.3f",
+                        stage_id,
+                        request.request_id,
+                        chunk_id,
+                        send_gap_ms,
+                    )
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
             # Sender uses struct attr access here; the receive path in
             # `_load_one_request` / `_update_request_payload` reads dict keys.
@@ -502,6 +554,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         self._code2wav_logged_first_send.discard(request_id)
         self._code2wav_poll_misses.pop(request_id, None)
+        self._code2wav_last_send_at.pop(request_id, None)
+        self._code2wav_last_receive_at.pop(request_id, None)
+        self._code2wav_received_at.pop(request_id, None)
         if request_id in self.finished_requests:
             self._evict_finished_active_streams({request_id})
         else:
@@ -531,6 +586,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_num_chunks_sent.pop(external_req_id, None)
         self.ramp_chunk_count.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
+        self._code2wav_last_send_at.pop(external_req_id, None)
+        self._code2wav_last_receive_at.pop(external_req_id, None)
+        self._code2wav_received_at.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
@@ -696,6 +754,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         for admission in group:
             request = admission.request
             request_id = request.request_id
+            if self._code2wav_gap_trace_ms:
+                received_at = self._code2wav_received_at.pop(request_id, None)
+                admission_delay_ms = (
+                    (time.monotonic() - received_at) * 1000.0
+                    if received_at is not None
+                    else 0.0
+                )
+                if admission_delay_ms >= self._code2wav_gap_trace_ms:
+                    logger.info(
+                        "Code2Wav gap trace: stage=%d event=group_released request_id=%s "
+                        "chunk_id=%d admission_delay_ms=%.3f group_size=%d",
+                        self.connector.stage_id,
+                        request_id,
+                        max(0, self.get_req_chunk.get(request_id, 1) - 1),
+                        admission_delay_ms,
+                        len(group),
+                    )
             self._remove_code2wav_pending_request(request_id)
             request.status = admission.target_status
             self.requests_with_ready_chunks.add(request_id)
@@ -1144,6 +1219,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._code2wav_microbatch.cancel(req_id)
             self._code2wav_logged_first_payload.discard(req_id)
             self._code2wav_logged_first_send.discard(req_id)
+            self._code2wav_last_send_at.pop(req_id, None)
+            self._code2wav_last_receive_at.pop(req_id, None)
+            self._code2wav_received_at.pop(req_id, None)
             self._active_streams.pop(req_id, None)
             self.requests_with_ready_chunks.discard(req_id)
             self.finished_requests.discard(req_id)
