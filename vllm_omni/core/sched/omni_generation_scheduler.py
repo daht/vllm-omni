@@ -56,6 +56,16 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
 
+    def has_requests(self) -> bool:
+        if self.chunk_transfer_adapter and self.chunk_transfer_adapter.has_pending_chunk_requests():
+            return True
+        return super().has_requests()
+
+    def has_unfinished_requests(self) -> bool:
+        if self.chunk_transfer_adapter and self.chunk_transfer_adapter.has_pending_chunk_requests():
+            return True
+        return super().has_unfinished_requests()
+
     def _handle_stopped_request(self, request: Request) -> bool:
         if (
             request.resumable

@@ -717,6 +717,17 @@ def test_code2wav_microbatch_restore_skips_pending_abort(build_adapter):
     assert list(adapter.waiting_for_chunk_waiting_requests) == [request]
 
 
+def test_code2wav_pending_chunk_requests_keep_scheduler_active(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("pending", RequestStatus.WAITING_FOR_CHUNK)
+
+    assert not adapter.has_pending_chunk_requests()
+
+    adapter.waiting_for_chunk_running_requests.append(request)
+
+    assert adapter.has_pending_chunk_requests()
+
+
 def test_fifo_promotion(build_adapter):
     adapter, _ = build_adapter(stage_id=1, max_num_seqs=2, active_stream_window=2)
     reqs = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(1, 5)]

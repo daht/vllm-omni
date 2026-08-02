@@ -824,6 +824,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """Count running requests temporarily removed while awaiting a chunk."""
         return len(self.waiting_for_chunk_running_requests)
 
+    def has_pending_chunk_requests(self) -> bool:
+        """Whether parked async-chunk requests still need scheduler progress."""
+        return bool(
+            self.waiting_for_chunk_waiting_requests
+            or self.waiting_for_chunk_running_requests
+            or self._held_non_active
+            or self._pending_load_reqs
+            or self._finished_load_reqs
+            or self._code2wav_microbatch.pending_count()
+        )
+
     def _preempt_non_active_running(self, waiting_queue: Any, running_queue: list[Request]) -> None:
         # Hold non-active running requests in a private deque rather than
         # routing them back through waiting_queue. Routing through the
